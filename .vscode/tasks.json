@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build DevContainer and verify tool installation",
+			"type": "shell",
+			"command": "echo 'DevContainer build will be triggered by VS Code. After container starts, run: go version && go env GOMOD && (which espflash || echo espflash not installed)'",
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}
