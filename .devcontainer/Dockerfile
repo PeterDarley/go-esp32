@@ -7,6 +7,25 @@ RUN apt-get update \
 
 WORKDIR /workspaces
 
+# ── arduino-cli ───────────────────────────────────────────────────────────
+# Used to build and flash the SoftAP sketch (softap/softap.ino).
+# The ESP32 Arduino core (~350 MB) is installed here so the image is
+# self-contained; it is cached in a Docker layer.
+ARG ARDUINO_CLI_VERSION=1.1.1
+RUN set -eux; \
+    curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_${ARDUINO_CLI_VERSION}_Linux_64bit.tar.gz" \
+        -o /tmp/arduino-cli.tar.gz; \
+    tar -C /usr/local/bin -xzf /tmp/arduino-cli.tar.gz arduino-cli; \
+    rm /tmp/arduino-cli.tar.gz; \
+    arduino-cli version
+
+# Install the Espressif ESP32 Arduino board package (3.x series uses arduino-esp32)
+RUN arduino-cli core update-index \
+        --additional-urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json" \
+    && arduino-cli core install esp32:esp32 \
+        --additional-urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+# ─────────────────────────────────────────────────────────────────────────
+
 # Install TinyGo, esptool, Rust toolchain, and espflash for building/flashing firmware
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl tar ca-certificates python3 python3-pip build-essential gnupg2 \

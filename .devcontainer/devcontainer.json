@@ -1,8 +1,5 @@
 {
   "name": "tinygo-esp32",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
   "runArgs": [
     "--privileged"
   ],
