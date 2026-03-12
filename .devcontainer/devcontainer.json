@@ -1,10 +1,12 @@
 {
   "name": "tinygo-esp32",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
   "runArgs": [
-    "--privileged"
+    "--device=/dev/ttyUSB0:/dev/ttyUSB0"
   ],
-  "postCreateCommand": "sudo usermod -a -G dialout vscode",
-  "postStartCommand": "ls /dev/ttyUSB* 2>/dev/null | xargs -r sudo chmod 666",
   "customizations": {
     "vscode": {
       "extensions": ["golang.go", "tinygo.vscode-tinygo"]

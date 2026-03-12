@@ -1,17 +1,18 @@
-// SoftAP + HTTP server for ESP32  (with template engine)
+// SoftAP + HTTP server for ESP32  (with template engine + captive portal)
 //
-// Build & flash:  make flash-softap
-// Connect phone:  join "peter_bot" WiFi (open, no password)
+// Build & flash:  make flash
+// Connect phone:  join "peter_bot" WiFi — browser pops up automatically
 // Open browser:   http://192.168.71.1/
 //
 // Routes
 //   GET /              – home page  (auto-refresh every 5 s)
 //   GET /api/status    – JSON status  { uptime_s, heap_free, clients, ip }
 //   GET /api/clients   – JSON list of connected station MACs
-//   *                  – 404
+//   *                  – captive portal redirect → /
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <esp_wifi.h>
 // FreeRTOS APIs used to create pinned tasks
 #include <freertos/FreeRTOS.h>
@@ -95,11 +96,60 @@ String uptimeStr() {
     return String(buf);
 }
 
+// Event handlers: log when stations connect/disconnect to the SoftAP
+void onStaConnected(arduino_event_id_t event, arduino_event_info_t info) {
+    uint8_t* mac = info.wifi_ap_staconnected.mac;
+    char macstr[18];
+    snprintf(macstr, sizeof(macstr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.printf("[softap] STA connected: %s\n", macstr);
+}
+
+void onStaDisconnected(arduino_event_id_t event, arduino_event_info_t info) {
+    uint8_t* mac = info.wifi_ap_stadisconnected.mac;
+    char macstr[18];
+    snprintf(macstr, sizeof(macstr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.printf("[softap] STA disconnected: %s\n", macstr);
+}
+
+// ── DNS server (captive portal) ───────────────────────────────────────────
+DNSServer dnsServer;
+static const uint8_t DNS_PORT = 53;
+
 // ── WebServer ──────────────────────────────────────────────────────────────
 WebServer server(80);
 
+// Log incoming HTTP requests: method, uri, client IP and query args
+String httpMethodStr() {
+    switch (server.method()) {
+        case HTTP_GET: return String("GET");
+        case HTTP_POST: return String("POST");
+        case HTTP_PUT: return String("PUT");
+        case HTTP_DELETE: return String("DELETE");
+        case HTTP_PATCH: return String("PATCH");
+        case HTTP_HEAD: return String("HEAD");
+        default: return String("OTHER");
+    }
+}
+
+void httpLog() {
+    String m = httpMethodStr();
+    IPAddress ip = server.client().remoteIP();
+    String u = server.uri();
+    Serial.printf("[http] %s %s from %s\n", m.c_str(), u.c_str(), ip.toString().c_str());
+    if (server.args() > 0) {
+        Serial.print("[http]  args:");
+        for (int i = 0; i < server.args(); i++) {
+            Serial.print(" "); Serial.print(server.argName(i)); Serial.print("="); Serial.print(server.arg(i));
+        }
+        Serial.println();
+    }
+}
+
 // GET /
 void handleRoot() {
+    httpLog();
     wifi_sta_list_t stalist;
     esp_wifi_ap_get_sta_list(&stalist);
     int cnt = stalist.num;
@@ -140,6 +190,7 @@ void handleRoot() {
 
 // GET /api/status  →  JSON
 void handleApiStatus() {
+    httpLog();
     wifi_sta_list_t stalist;
     esp_wifi_ap_get_sta_list(&stalist);
 
@@ -158,6 +209,7 @@ void handleApiStatus() {
 
 // GET /api/clients  →  JSON array of MAC addresses
 void handleApiClients() {
+    httpLog();
     wifi_sta_list_t stalist;
     esp_wifi_ap_get_sta_list(&stalist);
 
@@ -176,15 +228,30 @@ void handleApiClients() {
     server.send(200, "application/json", json);
 }
 
-// * → 404
+// Captive portal redirect — sends every unknown request to the home page.
+// Each OS uses a different probe URL to detect captive portals:
+//   iOS/macOS : GET /hotspot-detect.html  (expects Apple-specific content)
+//   Android   : GET /generate_204         (expects HTTP 204)
+//   Windows   : GET /connecttest.txt
+void handleCaptiveRedirect() {
+    httpLog();
+    server.sendHeader("Location", String("http://") + AP_IP.toString() + "/", true);
+    server.send(302, "text/plain", "");
+}
+
+// * → captive portal redirect (also handles unknown routes)
 void handleNotFound() {
-    String page = render(String(FPSTR(LAYOUT)), {
-        {"TITLE",   "404"},
-        {"REFRESH", ""},
-        {"CONTENT", "<div class='card'><h2>404 Not Found</h2><p>" +
-                    server.uri() + "</p></div>"},
-    });
-    server.send(404, "text/html", page);
+    handleCaptiveRedirect();
+}
+
+// DNS task: processes incoming DNS queries and replies with AP_IP (captive portal).
+void dnsTask(void *pvParameters) {
+    (void) pvParameters;
+    Serial.println("[dns] dnsTask started");
+    for (;;) {
+        dnsServer.processNextRequest();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 // HTTP server task: polls the WebServer and dispatches handlers.
@@ -209,6 +276,19 @@ void workerTask(void *pvParameters) {
     }
 }
 
+// Blink task: toggles the on-board LED (runs on ESP32 alongside httpd)
+static const int LED_PIN = 2;
+void blinkTask(void *pvParameters) {
+    (void) pvParameters;
+    pinMode(LED_PIN, OUTPUT);
+    for (;;) {
+        digitalWrite(LED_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        digitalWrite(LED_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 // ── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -228,20 +308,47 @@ void setup() {
     Serial.print("[softap] IP:      "); Serial.println(WiFi.softAPIP());
     Serial.print("[softap] Channel: "); Serial.println(AP_CHANNEL);
 
+    // Register WiFi event handlers to log clients attaching/detaching
+    WiFi.onEvent(onStaConnected, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+    WiFi.onEvent(onStaDisconnected, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+    WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+        char ip[16];
+        ip_event_ap_staipassigned_t& d = info.wifi_ap_staipassigned;
+        snprintf(ip, sizeof(ip), "%d.%d.%d.%d",
+                 (d.ip.addr) & 0xFF, (d.ip.addr >> 8) & 0xFF,
+                 (d.ip.addr >> 16) & 0xFF, (d.ip.addr >> 24) & 0xFF);
+        Serial.printf("[softap] STA got IP: %s\n", ip);
+    }, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
+
     server.on("/",            handleRoot);
     server.on("/api/status",  handleApiStatus);
     server.on("/api/clients", handleApiClients);
+    // Captive portal probe URLs used by each OS
+    server.on("/hotspot-detect.html",  handleCaptiveRedirect);  // iOS/macOS
+    server.on("/generate_204",         handleCaptiveRedirect);  // Android
+    server.on("/connecttest.txt",      handleCaptiveRedirect);  // Windows
+    server.on("/redirect",             handleCaptiveRedirect);  // some Android
     server.onNotFound(handleNotFound);
     server.begin();
 
+    // Start DNS server — resolves every hostname to our AP IP
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(DNS_PORT, "*", AP_IP);
+    Serial.println("[softap] DNS captive portal active");
+
     // Create FreeRTOS tasks:
-    // - httpdTask: dedicated task for handling HTTP requests
-    // - workerTask: does independent background work
-    xTaskCreatePinnedToCore(httpdTask, "httpd", 4096, NULL, 1, NULL, 1);
+    // - dnsTask:    services captive portal DNS queries
+    // - httpdTask:  handles HTTP requests
+    // - workerTask: background heartbeat
+    // - blinkTask:  toggles on-board LED
+    xTaskCreatePinnedToCore(dnsTask,    "dns",    4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(httpdTask,  "httpd",  4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(workerTask, "worker", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(blinkTask,  "blink",  2048, NULL, 1, NULL, 1);
 
     Serial.println("[softap] HTTP server listening on :80 (httpdTask)");
     Serial.println("[softap] Routes: /   /api/status   /api/clients");
+    Serial.println("[softap] Captive portal: phone browser will auto-open on connect");
 }
 
 // loop() is left empty because work is done in FreeRTOS tasks.

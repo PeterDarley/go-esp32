@@ -3,7 +3,8 @@ FROM mcr.microsoft.com/devcontainers/go:1
 # Minimal additions for the devcontainer environment
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && usermod -aG dialout vscode
 
 WORKDIR /workspaces
 
